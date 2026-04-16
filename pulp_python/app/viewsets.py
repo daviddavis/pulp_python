@@ -7,6 +7,12 @@ from packaging.utils import canonicalize_name
 from pathlib import Path
 from rest_framework import status
 from rest_framework.decorators import action
+from rest_framework.mixins import (
+    CreateModelMixin,
+    DestroyModelMixin,
+    ListModelMixin,
+    RetrieveModelMixin,
+)
 from rest_framework.response import Response
 from rest_framework.serializers import ValidationError
 
@@ -143,15 +149,20 @@ class PythonRepositoryViewSet(
         If allow_package_substitution is False and the request is **only** adding packages, then a
         package substitution check is performed to provide a quicker error response. Otherwise, the
         check is delegated to the task.
+
+        Also performs an early blocklist check on added packages.
         """
         repository = self.get_object()
+        add_content_units = request.data.get("add_content_units", [])
+        content_ids = [extract_pk(x) for x in add_content_units]
+
+        self._early_blocklist_check(repository, content_ids)
+
         if not repository.allow_package_substitution:
             remove_content_units = request.data.get("remove_content_units", [])
             if remove_content_units or "base_version" in request.data:
                 return super().modify(request, pk)
             rvc = repository.latest_version().content
-            add_content_units = request.data.get("add_content_units", [])
-            content_ids = [extract_pk(x) for x in add_content_units]
             packages = (
                 python_models.PythonPackageContent.objects.filter(pk__in=content_ids)
                 .exclude(pk__in=rvc)
@@ -166,6 +177,17 @@ class PythonRepositoryViewSet(
                     f"Existing conflicting packages: {conflicting_packages.values('filename', 'sha256', 'pk')}"  # noqa: E501
                 )
         return super().modify(request, pk)
+
+    def _early_blocklist_check(self, repository, content_ids):
+        """
+        Raise early if any added packages match a blocklist entry.
+        """
+        if not content_ids:
+            return
+        packages = python_models.PythonPackageContent.objects.filter(pk__in=content_ids).only(
+            "filename", "name_normalized", "version"
+        )
+        repository.check_blocklist_for_packages(packages)
 
     @extend_schema(
         summary="Repair metadata",
@@ -214,6 +236,60 @@ class PythonRepositoryViewSet(
             },
         )
         return core_viewsets.OperationPostponedResponse(result, request)
+
+
+class PythonBlocklistEntryViewSet(
+    core_viewsets.NamedModelViewSet,
+    CreateModelMixin,
+    RetrieveModelMixin,
+    ListModelMixin,
+    DestroyModelMixin,
+):
+    """
+    ViewSet for managing blocklist entries on a PythonRepository.
+
+    Blocklist entries prevent packages from being added to the repository.
+    Entries can match by package `name` (all versions), package `name` + `version`,
+    or exact `filename`. Exactly one of `name` or `filename` must be provided.
+    """
+
+    endpoint_name = "blocklist_entries"
+    router_lookup = "pythonblocklistentry"
+    parent_viewset = PythonRepositoryViewSet
+    parent_lookup_kwargs = {"repository_pk": "repository__pk"}
+    serializer_class = python_serializers.PythonBlocklistEntrySerializer
+    queryset = python_models.PythonBlocklistEntry.objects.all()
+    ordering = ("-pulp_created",)
+
+    DEFAULT_ACCESS_POLICY = {
+        "statements": [
+            {
+                "action": ["list", "retrieve"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": "has_repository_model_or_domain_or_obj_perms:python.view_pythonrepository",  # noqa: E501
+            },
+            {
+                "action": ["create", "destroy"],
+                "principal": "authenticated",
+                "effect": "allow",
+                "condition": [
+                    "has_repository_model_or_domain_or_obj_perms:python.modify_pythonrepository",
+                    "has_repository_model_or_domain_or_obj_perms:python.view_pythonrepository",
+                ],
+            },
+        ],
+    }
+
+    def get_serializer_context(self):
+        """
+        Inject the parent repository into the serializer context so that `validate()` can check for
+        duplicate entries. The guard on `repository_pk` prevents errors during schema generation.
+        """
+        context = super().get_serializer_context()
+        if self.kwargs.get("repository_pk"):
+            context["repository"] = self.get_parent_object()
+        return context
 
 
 class PythonRepositoryVersionViewSet(core_viewsets.RepositoryVersionViewSet):

@@ -14,6 +14,7 @@ from django_lifecycle import (
 from rest_framework.serializers import ValidationError
 from pulpcore.plugin.models import (
     AutoAddObjPermsMixin,
+    BaseModel,
     Content,
     Publication,
     Distribution,
@@ -399,9 +400,12 @@ class PythonRepository(Repository, AutoAddObjPermsMixin):
 
         When allow_package_substitution is False, reject any new version that would implicitly
         replace existing content with different checksums (content substitution).
+
+        Also checks newly added content against the repository's blocklist entries.
         """
         if not self.allow_package_substitution:
             self._check_for_package_substitution(new_version)
+        self._check_blocklist(new_version)
         remove_duplicates(new_version)
         validate_repo_version(new_version)
 
@@ -418,3 +422,63 @@ class PythonRepository(Repository, AutoAddObjPermsMixin):
                 "To allow this, set 'allow_package_substitution' to True on the repository. "
                 f"Conflicting packages: {duplicates}"
             )
+
+    def _check_blocklist(self, new_version):
+        """
+        Check newly added content in a repository version against the blocklist.
+        """
+        added_content = PythonPackageContent.objects.filter(
+            pk__in=new_version.added().values_list("pk", flat=True)
+        ).only("filename", "name_normalized", "version")
+        if added_content.exists():
+            self.check_blocklist_for_packages(added_content)
+
+    def check_blocklist_for_packages(self, packages):
+        """
+        Raise a ValidationError if any of the given packages match a blocklist entry.
+        """
+        entries = PythonBlocklistEntry.objects.filter(repository=self)
+        if not entries.exists():
+            return
+
+        blocked = []
+        for pkg in packages:
+            for entry in entries:
+                if entry.filename and entry.filename == pkg.filename:
+                    blocked.append(pkg.filename)
+                    break
+                if entry.name == pkg.name_normalized:
+                    if not entry.version or entry.version == pkg.version:
+                        blocked.append(pkg.filename)
+                        break
+        if blocked:
+            raise ValidationError(
+                "Blocklisted packages cannot be added to this repository: "
+                "{}".format(", ".join(blocked))
+            )
+
+
+class PythonBlocklistEntry(BaseModel):
+    """
+    An entry in a PythonRepository's package blocklist.
+
+    Blocklist entries prevent packages from being added to the repository.
+    Entries can match by package `name` (all versions), package `name` + `version`,
+    or exact `filename`. Exactly one of `name` or `filename` must be provided.
+    """
+
+    name = models.TextField(null=True, default=None)
+    version = models.TextField(null=True, default=None)
+    filename = models.TextField(null=True, default=None)
+    added_by = models.TextField(default="")
+    repository = models.ForeignKey(
+        PythonRepository, on_delete=models.CASCADE, related_name="blocklist_entries"
+    )
+
+    def __str__(self):
+        if self.filename:
+            return f"<{self._meta.object_name}: {self.filename}>"
+        return f"<{self._meta.object_name}: {self.name} [{self.version or 'all'}]>"
+
+    class Meta:
+        default_related_name = "%(app_label)s_%(model_name)s"

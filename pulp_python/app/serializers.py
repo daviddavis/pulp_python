@@ -6,6 +6,7 @@ from django.conf import settings
 from django.db.utils import IntegrityError
 from drf_spectacular.utils import extend_schema_serializer
 from packaging.requirements import Requirement
+from packaging.version import Version, InvalidVersion
 from rest_framework import serializers
 from pypi_attestations import AttestationError
 from pydantic import TypeAdapter, ValidationError
@@ -13,9 +14,10 @@ from urllib.parse import urljoin
 
 from pulpcore.plugin import models as core_models
 from pulpcore.plugin import serializers as core_serializers
-from pulpcore.plugin.util import get_domain, get_prn, get_current_authenticated_user
+from pulpcore.plugin.util import get_domain, get_prn, get_current_authenticated_user, reverse
 
 from pulp_python.app import models as python_models
+from pulp_python.app.utils import canonicalize_name
 from pulp_python.app.provenance import (
     Attestation,
     Provenance,
@@ -53,6 +55,11 @@ class PythonRepositorySerializer(core_serializers.RepositorySerializer):
         default=False,
         required=False,
     )
+    blocklist_entries_href = serializers.SerializerMethodField(
+        help_text=_("URL to the blocklist entries for this repository."),
+        read_only=True,
+    )
+
     allow_package_substitution = serializers.BooleanField(
         help_text=_(
             "Whether to allow package substitution (replacing existing packages with packages "
@@ -65,10 +72,15 @@ class PythonRepositorySerializer(core_serializers.RepositorySerializer):
         required=False,
     )
 
+    def get_blocklist_entries_href(self, obj):
+        repo_href = reverse("repositories-python/python-detail", kwargs={"pk": obj.pk})
+        return f"{repo_href}blocklist_entries/"
+
     class Meta:
         fields = core_serializers.RepositorySerializer.Meta.fields + (
             "autopublish",
             "allow_package_substitution",
+            "blocklist_entries_href",
         )
         model = python_models.PythonRepository
 
@@ -778,6 +790,115 @@ class PythonRemoteSerializer(core_serializers.RemoteSerializer):
             "provenance",
         )
         model = python_models.PythonRemote
+
+
+class PythonBlocklistEntrySerializer(core_serializers.ModelSerializer):
+    """
+    Serializer for PythonBlocklistEntry.
+
+    The `repository` is supplied by the URL (not the request body) and is injected
+    by the viewset before saving.
+    """
+
+    pulp_href = serializers.SerializerMethodField(
+        read_only=True,
+        help_text=_("The URL of this blocklist entry."),
+    )
+    repository = core_serializers.DetailRelatedField(
+        read_only=True,
+        view_name_pattern=r"repositories(-.*/.*)?-detail",
+        help_text=_("Repository this blocklist entry belongs to."),
+    )
+    name = serializers.CharField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=_(
+            "Package name to block (for all versions). Compared after PEP 503 normalization. "
+            "Required when 'filename' is not provided."
+        ),
+    )
+    version = serializers.CharField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=_("Exact version string to block (e.g. '1.0'). Only used when 'name' is set."),
+    )
+    filename = serializers.CharField(
+        required=False,
+        allow_null=True,
+        default=None,
+        help_text=_("Exact filename to block. Required when 'name' is not provided."),
+    )
+    added_by = serializers.CharField(
+        read_only=True,
+        help_text=_("PRN of the user who added this blocklist entry."),
+    )
+
+    def get_pulp_href(self, obj):
+        repo_href = reverse("repositories-python/python-detail", kwargs={"pk": obj.repository_id})
+        return f"{repo_href}blocklist_entries/{obj.pk}/"
+
+    def validate(self, data):
+        """
+        Validate that the blocklist entry is well-formed and not a duplicate.
+        """
+        name = data.get("name")
+        filename = data.get("filename")
+        version = data.get("version")
+
+        if version and filename:
+            raise serializers.ValidationError(_("'version' cannot be used with 'filename'."))
+        if version and not name:
+            raise serializers.ValidationError(_("'version' requires 'name' to be provided."))
+        if bool(name) == bool(filename):
+            raise serializers.ValidationError(
+                _("Exactly one of 'name' or 'filename' must be provided.")
+            )
+
+        if version:
+            try:
+                Version(version)
+            except InvalidVersion:
+                raise serializers.ValidationError(
+                    {"version": _("'{}' is not a valid version.").format(version)}
+                )
+        if name:
+            data["name"] = canonicalize_name(name)
+            name = data["name"]
+
+        repository = self.context.get("repository")
+        if repository:
+            qs = python_models.PythonBlocklistEntry.objects.filter(repository=repository)
+            if name and qs.filter(name=name, version=version).exists():
+                raise serializers.ValidationError(
+                    _("A blocklist entry with this name and version already exists.")
+                )
+            if filename and qs.filter(filename=filename).exists():
+                raise serializers.ValidationError(
+                    _("A blocklist entry with this filename already exists.")
+                )
+            data["repository"] = repository
+
+        return data
+
+    def create(self, validated_data):
+        """
+        Create a new blocklist entry, recording the authenticated user in `added_by`.
+        """
+        user = get_current_authenticated_user()
+        validated_data["added_by"] = get_prn(user) if user else ""
+        return super().create(validated_data)
+
+    class Meta:
+        fields = core_serializers.ModelSerializer.Meta.fields + (
+            "repository",
+            "name",
+            "version",
+            "filename",
+            "added_by",
+        )
+        model = python_models.PythonBlocklistEntry
 
 
 class PythonBanderRemoteSerializer(serializers.Serializer):
